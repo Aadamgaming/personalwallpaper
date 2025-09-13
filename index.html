@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Audio-reactive WebGL wallpaper</title>
+  <style>
+    html,body{height:100%;margin:0;background:#000;overflow:hidden;font-family:system-ui,Arial}
+    #ui{position:fixed;left:12px;top:12px;z-index:50;background:rgba(0,0,0,0.45);backdrop-filter:blur(6px);padding:10px;border-radius:8px;color:#fff}
+    #ui input, #ui button, #ui label{display:block;margin:6px 0}
+    #credits{position:fixed;right:12px;bottom:12px;color:#ddd;font-size:12px;background:rgba(0,0,0,0.25);padding:6px;border-radius:6px}
+    a{color:#8fd}
+    canvas{display:block}
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <strong>Audio source</strong>
+    <label><input type="radio" name="src" value="audio" checked> Use built-in audio player (drag & drop or open file)</label>
+    <label><input type="radio" name="src" value="mic"> Use microphone (live)</label>
+    <input id="file" type="file" accept="audio/*">
+    <button id="togglePlay">Play / Pause</button>
+    <small>Tip: to react to your system music you can route system audio to a virtual loopback and select it as the microphone/input.</small>
+  </div>
+
+  <div id="credits">Image: files.catbox.moe/dnu428.png · WebGL + Web Audio</div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.155.0/build/three.module.js';
+
+    // --- config ---
+    const IMAGE_URL = 'https://files.catbox.moe/dnu428.png';
+    const FFT_SIZE = 2048; // bigger = more frequency resolution
+
+    // --- scene setup ---
+    const renderer = new THREE.WebGLRenderer({antialias:true});
+    renderer.setPixelRatio(window.devicePixelRatio || 1);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+
+    // load image texture
+    const loader = new THREE.TextureLoader();
+    loader.crossOrigin = 'anonymous';
+    const imgTex = loader.load(IMAGE_URL, ()=>{
+      imgTex.minFilter = THREE.LinearFilter;
+      imgTex.magFilter = THREE.LinearFilter;
+    });
+
+    // create data texture for frequency data (1D texture)
+    const bandCount = 256; // number of frequency bands we'll send to shader
+    const dataArray = new Uint8Array(bandCount * 3); // RGB texture, but we'll only use R
+    const dataTex = new THREE.DataTexture(dataArray, bandCount, 1, THREE.RGBFormat);
+    dataTex.needsUpdate = true;
+    dataTex.minFilter = THREE.NearestFilter;
+    dataTex.magFilter = THREE.NearestFilter;
+
+    // full-screen quad with custom shader
+    const geometry = new THREE.PlaneGeometry(2,2);
+
+    const material = new THREE.ShaderMaterial({
+      uniforms: {
+        uImage: {value: imgTex},
+        uTime: {value: 0},
+        uResolution: {value: new THREE.Vector2(window.innerWidth, window.innerHeight)},
+        uFreq: {value: dataTex},
+        uBands: {value: bandCount},
+        uIntensity: {value: 1.0}
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main(){ vUv = uv; gl_Position = vec4(position,1.0); }
+      `,
+      fragmentShader: `
+        precision mediump float;
+        uniform sampler2D uImage;
+        uniform sampler2D uFreq;
+        uniform float uTime;
+        uniform vec2 uResolution;
+        uniform int uBands;
+        uniform float uIntensity;
+        varying vec2 vUv;
+
+        // helper: get band value for x position
+        float bandValue(float x){
+          // map x [0,1] to band index
+          float idx = floor(x * float(uBands));
+          float fx = (idx + 0.5) / float(uBands);
+          vec3 v = texture2D(uFreq, vec2(fx, 0.5)).rgb;
+          return v.r; // 0..255
+        }
+
+        void main(){
+          vec2 uv = vUv;
+
+          // sample base image
+          vec4 base = texture2D(uImage, uv);
+
+          // create reactive lines: multiple horizontal lines displaced by audio
+          float lines = 0.0;
+          const float LINE_COUNT = 80.0;
+          for(float i=0.0;i<LINE_COUNT;i++){
+            float fi = i / LINE_COUNT; // 0..1
+            // sample a band based on vertical position and time-mod
+            float band = bandValue(fi);
+            float amp = band / 255.0; // 0..1
+            // create a y position for this line, oscillating slightly
+            float y = fi + 0.02 * sin(uTime*0.8 + fi*6.28);
+            // compute distance from current uv.y
+            float d = abs(uv.y - y);
+            // warping using the amplitude (wider when stronger)
+            float width = 0.002 + 0.015 * amp * float(1.0 - fi);
+            float line = smoothstep(width, 0.0, d);
+            // horizontal jitter - sample height displacement from audio
+            float jitter = 0.02 * amp * sin(uv.x*60.0 + uTime*2.0 + fi*12.0);
+            // fetch color from image shifted by jitter
+            vec2 sampleUV = vec2(mod(uv.x + jitter,1.0), clamp(y,0.0,1.0));
+            vec4 col = texture2D(uImage, sampleUV);
+            // stronger bands produce brighter lines
+            lines += line * (0.6 + 1.4*amp) * (0.5 + 0.5*col.r);
+          }
+
+          // blend lines on top of base image
+          vec3 finalColor = mix(base.rgb, base.rgb + vec3(lines), 0.9);
+
+          gl_FragColor = vec4(finalColor, 1.0);
+        }
+      `,
+      transparent: false
+    });
+
+    const mesh = new THREE.Mesh(geometry, material);
+    scene.add(mesh);
+
+    // --- Web Audio setup ---
+    let audioCtx = null;
+    let analyser = null;
+    let sourceNode = null;
+    let audioElement = null;
+    let micStream = null;
+
+    function ensureAudioCtx(){
+      if(!audioCtx){
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+    }
+
+    function createAnalyser(){
+      ensureAudioCtx();
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = FFT_SIZE;
+    }
+
+    function connectSource(node){
+      if(sourceNode) try{ sourceNode.disconnect(); }catch(e){}
+      sourceNode = node;
+      sourceNode.connect(analyser);
+      analyser.connect(audioCtx.destination); // allow hearing playback when using audio element
+    }
+
+    // update dataTex from analyser
+    const freqData = new Uint8Array(FFT_SIZE/2);
+    function updateFreqTexture(){
+      if(!analyser) return;
+      analyser.getByteFrequencyData(freqData);
+      // we'll sample across freqData to fill bandCount
+      for(let i=0;i<bandCount;i++){
+        // map i to index in freqData (logarithmic mapping looks nicer)
+        const fi = i / bandCount;
+        // use exponential mapping for perceptual distribution
+        const idx = Math.floor(Math.pow(fi, 1.6) * (freqData.length-1));
+        const v = freqData[idx];
+        const o = i*3;
+        dataArray[o] = v; // R
+        dataArray[o+1] = v;
+        dataArray[o+2] = v;
+      }
+      dataTex.needsUpdate = true;
+    }
+
+    // --- UI and file handling ---
+    const fileInput = document.getElementById('file');
+    const toggleBtn = document.getElementById('togglePlay');
+    const radioButtons = document.getElementsByName('src');
+
+    fileInput.addEventListener('change', async (e)=>{
+      const f = e.target.files && e.target.files[0];
+      if(!f) return;
+      if(audioElement){ audioElement.pause(); audioElement.src = ''; }
+      audioElement = new Audio();
+      audioElement.src = URL.createObjectURL(f);
+      audioElement.crossOrigin = 'anonymous';
+      audioElement.loop = true;
+      await audioElement.play().catch(()=>{});
+
+      if(!audioCtx) createAnalyser();
+      const node = audioCtx.createMediaElementSource(audioElement);
+      connectSource(node);
+    });
+
+    toggleBtn.addEventListener('click',()=>{
+      if(radioValue() !== 'audio') return;
+      if(!audioElement) return;
+      if(audioElement.paused) audioElement.play(); else audioElement.pause();
+    });
+
+    function radioValue(){ for(const r of radioButtons) if(r.checked) return r.value; }
+
+    // watch radio change
+    for(const r of radioButtons){ r.addEventListener('change', async ()=>{
+      const v = radioValue();
+      if(v === 'mic'){
+        // switch to microphone
+        if(micStream) return; // already on
+        try{
+          micStream = await navigator.mediaDevices.getUserMedia({audio:true, video:false});
+          if(!audioCtx) createAnalyser();
+          const src = audioCtx.createMediaStreamSource(micStream);
+          connectSource(src);
+        }catch(err){ alert('Microphone access denied or not available.');
+          // revert to audio
+          document.querySelector('input[value="audio"]').checked = true;
+        }
+      }else{
+        // stop mic if active
+        if(micStream){
+          micStream.getTracks().forEach(t=>t.stop());
+          micStream = null;
+          if(sourceNode) sourceNode.disconnect();
+        }
+      }
+    }) }
+
+    // allow drag-drop of audio onto page
+    window.addEventListener('dragover',e=>{ e.preventDefault(); });
+    window.addEventListener('drop', async (e)=>{
+      e.preventDefault();
+      const f = e.dataTransfer.files && e.dataTransfer.files[0];
+      if(f && f.type.startsWith('audio')){
+        fileInput.files = e.dataTransfer.files;
+        fileInput.dispatchEvent(new Event('change'));
+        document.querySelector('input[value="audio"]').checked = true;
+      }
+    });
+
+    // --- animation loop ---
+    let start = performance.now();
+    function onResize(){
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      material.uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
+    }
+    window.addEventListener('resize', onResize);
+
+    function animate(now){
+      const t = (now - start) / 1000;
+      material.uniforms.uTime.value = t;
+
+      // update audio texture
+      if(analyser) updateFreqTexture();
+      material.uniforms.uFreq.value = dataTex;
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+
+    // autoplay a silent audio to warm the audio context on user gesture
+    window.addEventListener('pointerdown', async ()=>{
+      if(!audioCtx) createAnalyser();
+      if(audioCtx.state === 'suspended') try{ await audioCtx.resume(); }catch(e){}
+    }, {once:true});
+
+    // small accessibility: press space to toggle play when using audio element
+    window.addEventListener('keydown', (e)=>{ if(e.code === 'Space'){ e.preventDefault(); toggleBtn.click(); } });
+
+    // clean up on page unload
+    window.addEventListener('beforeunload', ()=>{
+      if(audioCtx) audioCtx.close();
+      if(micStream) micStream.getTracks().forEach(t=>t.stop());
+    });
+
+  </script>
+</body>
+</html>
