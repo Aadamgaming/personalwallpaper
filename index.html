@@ -1,90 +1,65 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Audio Reactive Lines Wallpaper</title>
+  <meta charset="UTF-8">
+  <title>Lively Visualizer</title>
   <style>
-    html,body{height:100%;margin:0;background:#000;overflow:hidden}
-    canvas{display:block}
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: black;
+    }
+    canvas {
+      display: block;
+    }
   </style>
 </head>
 <body>
-  <script type="module">
-    import * as THREE from 'https://unpkg.com/three@0.155.0/build/three.module.js';
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+let W, H;
 
-    const IMAGE_URL = 'https://files.catbox.moe/dnu428.png';
-    const FFT_SIZE = 256;
-    const BAR_COUNT = 64;
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+}
+window.addEventListener("resize", resize);
+resize();
 
-    // renderer and scene
-    const renderer = new THREE.WebGLRenderer({antialias:true});
-    renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    document.body.appendChild(renderer.domElement);
+const bg = new Image();
+bg.src = "https://files.catbox.moe/dnu428.png";
 
-    const scene = new THREE.Scene();
-    const camera = new THREE.OrthographicCamera(-1,1,1,-1,0,10);
+// how many bars
+const BAR_COUNT = 64;
 
-    // image plane
-    const loader = new THREE.TextureLoader();
-    loader.crossOrigin = 'anonymous';
-    const imgTex = loader.load(IMAGE_URL);
-    const bgMat = new THREE.MeshBasicMaterial({map: imgTex});
-    const bgMesh = new THREE.Mesh(new THREE.PlaneGeometry(2,2), bgMat);
-    scene.add(bgMesh);
+function drawFrame() {
+  requestAnimationFrame(drawFrame);
 
-    // bar geometry
-    const bars = [];
-    const barGroup = new THREE.Group();
-    for(let i=0;i<BAR_COUNT;i++){
-      const geo = new THREE.PlaneGeometry(2/BAR_COUNT*0.8,1);
-      const mat = new THREE.MeshBasicMaterial({color:0xffffff});
-      const mesh = new THREE.Mesh(geo,mat);
-      mesh.position.x = -1 + (i+0.5)*(2/BAR_COUNT);
-      mesh.position.y = -1; // bottom
-      mesh.scale.y = 0.01; // initial small height
-      bars.push(mesh);
-      barGroup.add(mesh);
-    }
-    scene.add(barGroup);
+  // clear and draw background
+  ctx.clearRect(0,0,W,H);
+  if (bg.complete) {
+    ctx.drawImage(bg, 0, 0, W, H);
+  }
 
-    // audio
-    let ctx = new (window.AudioContext||window.webkitAudioContext)();
-    let analyser = ctx.createAnalyser();
-    analyser.fftSize = FFT_SIZE;
-    let data = new Uint8Array(analyser.frequencyBinCount);
+  // get Lively system audio FFT
+  const data = LivelyAudio.getAudioData(BAR_COUNT);
 
-    // attempt to capture audio from system (user needs to allow)
-    async function initAudio(){
-      try{
-        const stream = await navigator.mediaDevices.getUserMedia({audio:true});
-        const src = ctx.createMediaStreamSource(stream);
-        src.connect(analyser);
-      }catch(e){
-        console.error('Microphone/system audio required');
-      }
-    }
-    initAudio();
+  // draw bars at bottom
+  const barWidth = W / BAR_COUNT;
+  ctx.fillStyle = "#00ffcc";
+  for (let i=0;i<BAR_COUNT;i++) {
+    const v = data[i] / 255; // 0..1
+    const barHeight = v * (H/2); // scale
+    const x = i * barWidth;
+    const y = H - barHeight;
+    ctx.fillRect(x, y, barWidth*0.8, barHeight);
+  }
+}
 
-    // resize
-    function onResize(){
-      renderer.setSize(window.innerWidth, window.innerHeight);
-    }
-    window.addEventListener('resize', onResize);
-
-    function animate(){
-      requestAnimationFrame(animate);
-      analyser.getByteFrequencyData(data);
-      for(let i=0;i<BAR_COUNT;i++){
-        const idx = Math.floor(i*data.length/BAR_COUNT);
-        const v = data[idx]/255;
-        bars[i].scale.y = v*1.5; // scale height based on volume
-        bars[i].position.y = -1 + (bars[i].scale.y/2);
-      }
-      renderer.render(scene,camera);
-    }
-    animate();
-  </script>
+drawFrame();
+</script>
 </body>
 </html>
